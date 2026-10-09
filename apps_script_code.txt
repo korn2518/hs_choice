@@ -1,0 +1,143 @@
+/**
+ * 고교 선택 길잡이 - 학생 응답 취합용 Google Apps Script
+ *
+ * [설치 순서]
+ * 1. 구글 드라이브에서 새 구글 스프레드시트를 만든다. (예: "2027 고교 선택 조사")
+ * 2. 메뉴에서 확장 프로그램 > Apps Script 를 연다.
+ * 3. 처음 보이는 코드를 모두 지우고, 이 파일의 내용 전체를 붙여 넣은 뒤 저장한다.
+ * 4. 위쪽 함수 목록에서 setup 을 고르고 [실행]을 누른다. 권한 요청이 나오면 허용한다.
+ *    (시트에 "응답", "기록", "학교별집계" 탭이 생기면 성공)
+ * 5. 오른쪽 위 [배포] > [새 배포] > 유형: 웹 앱
+ *    - 다음 사용자 인증 정보로 실행: 나
+ *    - 액세스 권한이 있는 사용자: 모든 사용자
+ *    [배포]를 누르고, 나오는 "웹 앱 URL"(https://script.google.com/macros/s/.../exec)을 복사한다.
+ * 6. index.html 을 메모장으로 열어 맨 위쪽의
+ *       const GAS_URL = "";
+ *    따옴표 안에 복사한 주소를 붙여 넣고 저장한 뒤, GitHub Pages 에 올린다.
+ *
+ * [시트 구성]
+ * - 응답: 학생 한 명당 한 줄. 같은 번호와 이름으로 다시 제출하면 그 줄을 덮어쓴다.
+ * - 기록: 제출할 때마다 한 줄씩 쌓이는 원본 기록.
+ * - 학교별집계: 학교별 1순위 수, 선택 수, 선택한 학생. 제출이 들어올 때마다 다시 계산된다.
+ *
+ * 코드를 고친 뒤에는 [배포] > [배포 관리] > 연필 아이콘 > 버전: 새 버전 으로 다시 배포해야 반영된다.
+ */
+
+var SHEET_RESP = '응답';
+var SHEET_LOG = '기록';
+var SHEET_SUM = '학교별집계';
+var HEAD = ['제출시각', '번호', '이름', '거주지', '평준화 여부',
+            '거주 1순위', '거주 2순위', '거주 3순위', '거주 4순위', '거주 5순위',
+            '전국단위 선택', '전기 학교 수', '후기 학교 수', '메모', '원본'];
+
+function setup() {
+  var ss = SpreadsheetApp.getActiveSpreadsheet();
+  sheet_(ss, SHEET_RESP, HEAD);
+  sheet_(ss, SHEET_LOG, ['제출시각', '번호', '이름', '원본']);
+  sheet_(ss, SHEET_SUM, ['학교', '구분', '유형', '전기/후기', '1순위 수', '선택 수', '학생']);
+}
+
+// 주소를 브라우저에 직접 넣어 보면 {"ok":true,...} 가 보인다. 연결 확인용.
+function doGet() {
+  return out_({ok: true, app: '고교 선택 길잡이 취합', time: new Date().toISOString()});
+}
+
+function doPost(e) {
+  var lock = LockService.getScriptLock();
+  try {
+    lock.waitLock(20000);
+    var d = JSON.parse(e.postData.contents);
+    if (!d || !String(d.name || '').trim()) throw new Error('이름이 없습니다.');
+    var ss = SpreadsheetApp.getActiveSpreadsheet();
+    var sh = sheet_(ss, SHEET_RESP, HEAD);
+    var now = new Date();
+    var local = d.local || [], nat = d.nat || [];
+    var all = local.concat(nat);
+
+    var row = [now, safe_(d.num), safe_(d.name), safe_(((d.sido || '') + ' ' + (d.sgg || '')).trim()), safe_(d.status)];
+    for (var i = 0; i < 5; i++) row.push(local[i] ? safe_(fmt_(local[i])) : '');
+    row.push(safe_(nat.map(function (x) { return (x.cat ? x.cat + ': ' : '') + fmt_(x); }).join('\n')));
+    row.push(all.filter(function (x) { return x.term === '전기'; }).length);
+    row.push(all.filter(function (x) { return x.term === '후기'; }).length);
+    row.push(safe_(d.memo));
+    row.push(JSON.stringify(d));
+
+    // 같은 번호 + 이름이 있으면 그 줄을 덮어쓴다.
+    var key = norm_(d.num) + '|' + norm_(d.name);
+    var last = sh.getLastRow(), found = 0;
+    if (last > 1) {
+      var vals = sh.getRange(2, 2, last - 1, 2).getDisplayValues();
+      for (var r = 0; r < vals.length; r++) {
+        if (norm_(vals[r][0]) + '|' + norm_(vals[r][1]) === key) { found = r + 2; break; }
+      }
+    }
+    if (found) sh.getRange(found, 1, 1, row.length).setValues([row]);
+    else sh.appendRow(row);
+
+    sheet_(ss, SHEET_LOG, ['제출시각', '번호', '이름', '원본']).appendRow([now, safe_(d.num), safe_(d.name), JSON.stringify(d)]);
+    summary_(ss);
+    return out_({ok: true, updated: !!found});
+  } catch (err) {
+    return out_({ok: false, error: String(err)});
+  } finally {
+    try { lock.releaseLock(); } catch (e2) {}
+  }
+}
+
+// 학교별집계 탭을 응답 탭의 원본 열로부터 다시 만든다.
+function summary_(ss) {
+  var sh = sheet_(ss, SHEET_RESP, HEAD);
+  var last = sh.getLastRow();
+  var map = {};
+  if (last > 1) {
+    var raw = sh.getRange(2, HEAD.length, last - 1, 1).getValues();
+    for (var r = 0; r < raw.length; r++) {
+      var d; try { d = JSON.parse(raw[r][0]); } catch (e) { continue; }
+      var who = (d.num ? d.num + '번 ' : '') + d.name;
+      (d.local || []).forEach(function (x) { add_(map, x, '거주지역', who + '(' + x.rank + '순위)', x.rank === 1); });
+      (d.nat || []).forEach(function (x) { add_(map, x, '전국단위', who, false); });
+    }
+  }
+  var rows = Object.keys(map).map(function (k) {
+    var m = map[k];
+    return [safe_(m.name), m.where, safe_(m.kind), safe_(m.term), m.first, m.total, safe_(m.students.join(', '))];
+  }).sort(function (a, b) { return b[5] - a[5] || b[4] - a[4]; });
+  var out = sheet_(ss, SHEET_SUM, ['학교', '구분', '유형', '전기/후기', '1순위 수', '선택 수', '학생']);
+  if (out.getLastRow() > 1) out.getRange(2, 1, out.getLastRow() - 1, 7).clearContent();
+  if (rows.length) out.getRange(2, 1, rows.length, 7).setValues(rows);
+}
+
+function add_(map, x, where, who, first) {
+  var k = where + '|' + x.name;
+  if (!map[k]) map[k] = {name: x.name, where: where, kind: x.kind || '', term: x.term || '', first: 0, total: 0, students: []};
+  map[k].total++;
+  if (first) map[k].first++;
+  map[k].students.push(who);
+}
+
+function fmt_(x) {
+  var km = (x.km === '' || x.km == null) ? '' : ', ' + (x.approx ? '약 ' : '') + x.km + 'km';
+  return x.name + ' (' + (x.kind || '') + ', ' + (x.term || '') + km + ')';
+}
+
+function sheet_(ss, name, head) {
+  var sh = ss.getSheetByName(name);
+  if (!sh) sh = ss.insertSheet(name);
+  if (sh.getLastRow() === 0) {
+    sh.getRange(1, 1, 1, head.length).setValues([head]).setFontWeight('bold');
+    sh.setFrozenRows(1);
+  }
+  return sh;
+}
+
+function norm_(v) { return String(v == null ? '' : v).replace(/^'/, '').replace(/\s+/g, ''); }
+
+// 수식으로 해석될 수 있는 글자로 시작하면 글자로만 저장되게 한다.
+function safe_(v) {
+  var s = String(v == null ? '' : v);
+  return /^[=+\-@]/.test(s) ? "'" + s : s;
+}
+
+function out_(obj) {
+  return ContentService.createTextOutput(JSON.stringify(obj)).setMimeType(ContentService.MimeType.JSON);
+}
